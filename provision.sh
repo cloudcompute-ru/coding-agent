@@ -29,14 +29,28 @@
 # in config/applications.php. The customer app owns the API key and model
 # name, so the final stage (open_tunnel) reports ONLY tunnel_url back —
 # api_key / model_name are NOT sent (the app is the source of truth and
-# already has them; resending would be redundant and could mask a drift
-# bug). The sticky-merge in AgentProvisionController keeps the pre-seeded
-# values across our stage updates.
+# already has them). The sticky-merge in AgentProvisionController keeps the
+# pre-seeded values across our stage updates.
+#
+# NOTE on the lack of a max_model_len proxy: the sibling cursor-llm app
+# ships a small proxy (proxy.py) that advertises a smaller max_model_len
+# than vLLM enforces, because Cursor reads /v1/models and overshoots the
+# context cap by +1 token every request. That is a Cursor-specific bug.
+# coding-agent targets VS Code agents (Cline et al.) that respect the
+# advertised cap, so we serve vLLM directly on the public port — no proxy,
+# no internal/public port split.
 
 set -euo pipefail
 
 CC_PROVISION_URL="${CC_PROVISION_URL:-}"
 CC_AGENT_TOKEN="${CC_AGENT_TOKEN:-}"
+
+# Tracks the stage we last *entered* so the trap-ERR handler below can
+# attribute an unexpected failure to the right manifest stage. Updated by
+# report_stage on every call. Initialized to the first stage so a crash
+# during the very first lines (before report_stage runs) still has a sane
+# stage to report.
+CC_CURRENT_STAGE="install_runtime"
 
 # Model + serving config. Defaults target Qwen2.5-Coder-32B AWQ — a 32B-class
 # coding model quantized to INT4, peaks at ~22 GB VRAM, runs comfortably on a
@@ -50,7 +64,60 @@ MODEL_ID="${MODEL_ID:-Qwen/Qwen2.5-Coder-32B-Instruct-AWQ}"
 # switching MODEL_ID later doesn't break user-saved client settings. Falls
 # back to the app's default short id when run manually.
 SERVED_MODEL_NAME="${CC_SERVED_MODEL_NAME:-${SERVED_MODEL_NAME:-qwen2.5-coder-32b}}"
+
+# Public port — what cloudflared exposes and what the client talks to.
+# vLLM binds this directly (no proxy in front, unlike cursor-llm).
 VLLM_PORT="${VLLM_PORT:-8000}"
+
+# vLLM `--max-model-len` cap on per-request prompt+completion tokens, chosen
+# by GPU VRAM. Agentic coding clients stuff a lot of file/context into the
+# prompt, so a bigger window is better when the card can afford it.
+#
+# Per-token KV cache for Qwen 2.5 32B (GQA, 64 layers x 8 KV heads x 128
+# head_dim x fp16) ~= 256 KiB. The model itself is ~18 GiB AWQ INT4. Budget
+# remaining at gpu_memory_utilization 0.92 is roughly (vram_gib x 0.92) - 18;
+# one full request needs max_len x 256 KiB.
+#
+#   24 GiB card  -> ~4 GiB KV -> ~16k tokens KV total -> 16k cap is the hard
+#                   ceiling. YaRN-extending here would make vLLM refuse to
+#                   even start up.
+#   40 GiB+      -> ~18 GiB+ KV -> can hold a 65k single request comfortably.
+#
+# 65k is reached via YaRN x2 RoPE scaling (Qwen's native context is 32k;
+# beyond that requires explicit YaRN config + the
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 escape hatch — vLLM refuses the bigger
+# max-model-len without it because un-scaled RoPE produces NaN past
+# max_position_embeddings). Quality cost on Qwen 2.5 32B in the 32k-64k
+# range is ~3-5%, well below what subjective coding usage notices.
+#
+# Detected via nvidia-smi at runtime so a single provision.sh works on the
+# whole GPU lineup the customer-app filter (min_vram_gb=24) lands us on.
+if command -v nvidia-smi >/dev/null 2>&1; then
+    GPU_VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 || echo 0)
+else
+    GPU_VRAM_MB=0
+fi
+if [ "${GPU_VRAM_MB:-0}" -ge 38000 ]; then
+    MAX_MODEL_LEN_DEFAULT=65536
+    YARN_NEEDED=1
+else
+    MAX_MODEL_LEN_DEFAULT=16384
+    YARN_NEEDED=0
+fi
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-$MAX_MODEL_LEN_DEFAULT}"
+
+# Build the YaRN args conditionally — passing rope_scaling on a native-context
+# launch (<= 32k) is harmless but the VLLM_ALLOW_LONG_MAX_MODEL_LEN env is
+# only meaningful when we actually exceed max_position_embeddings. Keep both
+# gated to the extended-context path so the 24 GiB launch line stays minimal.
+EXTRA_VLLM_ARGS=()
+if [ "$YARN_NEEDED" = "1" ]; then
+    export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+    EXTRA_VLLM_ARGS+=(
+        --hf-overrides
+        '{"rope_scaling":{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":32768}}'
+    )
+fi
 
 # Where vLLM and supporting tooling get installed. /workspace persists across
 # Vast container restarts where /root does not, so prefer /workspace when it
@@ -74,11 +141,16 @@ TUNNEL_LOG="${LOG_DIR}/cloudflared.log"
 # a missed update is far preferable to crashing provisioning halfway
 # through.
 report_stage() {
+    local stage="$1"
+    shift
+    # Always update the stage tracker, even when reporting is disabled (no
+    # env vars). The trap-ERR handler still needs an accurate stage for its
+    # own log line in that case.
+    CC_CURRENT_STAGE="$stage"
+
     if [ -z "$CC_PROVISION_URL" ] || [ -z "$CC_AGENT_TOKEN" ]; then
         return 0
     fi
-    local stage="$1"
-    shift
     local extra=""
     for kv in "$@"; do
         extra="${extra},${kv}"
@@ -95,6 +167,58 @@ report_stage() {
 log() {
     echo "[cc-provision] $*"
 }
+
+# Sanitize an arbitrary string for inlining into a JSON value: strip CR, fold
+# newlines to spaces, and replace double-quotes with single-quotes. Use this
+# on every dynamic substring (log tails, error messages, command names)
+# before splicing into a `"message":"..."` payload, otherwise a stray quote
+# in the source produces invalid JSON and AgentProvisionController 422s the
+# request.
+json_escape() {
+    printf '%s' "$1" | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g'
+}
+
+# trap-ERR handler — fires for any command that fails under `set -e` and
+# wasn't already handled with explicit `report_stage ... "\"message\":...\""`
+# + `exit 1`. Without this, an unexpected failure (e.g. `pip install` 503,
+# `mkdir -p` on a read-only mount, a shell typo we never hit in testing)
+# kills the script silently. The backend then has nothing on
+# `provision_state.message` and only the 30-min OVERALL_TIMEOUT eventually
+# flips the instance to ERROR — a window where the user is billed for
+# nothing.
+#
+# Behaviour:
+#   1. Disable the trap immediately to prevent recursion if anything inside
+#      the handler also fails.
+#   2. Capture exit code, line, and the command text BEFORE doing any other
+#      work (later commands would clobber $? / $BASH_COMMAND).
+#   3. POST a fatal `message` tagged to CC_CURRENT_STAGE. The customer app's
+#      provisioning-failed predicate picks this up on the next polling tick
+#      and flips the instance to ERROR with a clear message in seconds, not
+#      30 minutes.
+#   4. Re-exit with the original code so anything downstream observes the
+#      same failure.
+handle_uncaught_error() {
+    local exit_code=$?
+    trap - ERR
+
+    local line_no="${1:-?}"
+    local command_text
+    command_text="$(json_escape "${2:-?}")"
+
+    log "uncaught error at line ${line_no} (stage=${CC_CURRENT_STAGE}, exit=${exit_code}): ${2:-?}"
+
+    report_stage "$CC_CURRENT_STAGE" \
+        "\"message\":\"Скрипт упал на line ${line_no}: ${command_text} (exit ${exit_code})\""
+
+    # Bash treats `exit 0` as success, but we got here BECAUSE something
+    # failed — fall back to 1 if the captured code somehow ended up 0.
+    if [ "$exit_code" -eq 0 ]; then
+        exit_code=1
+    fi
+    exit "$exit_code"
+}
+trap 'handle_uncaught_error "$LINENO" "$BASH_COMMAND"' ERR
 
 # The API key the app generated for this instance. The customer app exports
 # it as CC_VLLM_API_KEY and already shows it on the dashboard; we serve with
@@ -123,11 +247,10 @@ report_stage install_runtime
 # image this is what actually installs vLLM (~5 min cold install).
 pip install --no-cache-dir -U "vllm>=0.6.0" >/dev/null
 
-# cloudflared: standalone static binary, no apt repo needed. ~30 MB. Used
-# to open a free trycloudflare.com quick tunnel that gives us a public
-# HTTPS URL pointing at localhost:VLLM_PORT — coding clients' "Add custom
-# model" UIs require HTTPS, which Vast.ai's raw <ip>:<port> mappings can't
-# provide.
+# cloudflared: standalone static binary, no apt repo needed. ~30 MB. Used to
+# open a free trycloudflare.com quick tunnel that gives us a public HTTPS URL
+# pointing at localhost:VLLM_PORT — coding clients' "Add custom model" UIs
+# require HTTPS, which Vast.ai's raw <ip>:<port> mappings can't provide.
 CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
 if ! [ -x "$CLOUDFLARED_BIN" ]; then
     log "installing cloudflared"
@@ -151,19 +274,19 @@ sleep 2
 
 # --- stage 2: download_model ---------------------------------------------
 #
-# vLLM auto-downloads weights from HuggingFace the first time you reference
-# a HF model id. There's no good way to grab a percentage from inside the
-# vLLM startup so we report a coarse 0%/100% transition. The model is
-# ~20 GB; on a Vast host with a 500+ Mbps uplink (we filter for these in
+# vLLM auto-downloads weights from HuggingFace the first time you reference a
+# HF model id. There's no good way to grab a percentage from inside the vLLM
+# startup so we report a coarse 0%/100% transition. The model is ~20 GB; on a
+# Vast host with a 500+ Mbps uplink (we filter for these in
 # ApplicationsController) it takes ~5-7 minutes.
 
 log "stage: download_model"
 report_stage download_model '"progress_pct":0'
 
-# Pre-download via huggingface-hub so we can decouple "weights on disk"
-# from "vLLM startup" — that way if the model download fails we report it
-# at the right stage, instead of having the user see a confusing
-# "starting server" failure that actually originated in HF.
+# Pre-download via huggingface-hub so we can decouple "weights on disk" from
+# "vLLM startup" — that way if the model download fails we report it at the
+# right stage, instead of having the user see a confusing "starting server"
+# failure that actually originated in HF.
 pip install --no-cache-dir -U "huggingface_hub[cli]>=0.26.0" >/dev/null
 
 HF_HOME="${HF_HOME:-${WORKDIR}/hf-cache}"
@@ -174,7 +297,7 @@ if ! huggingface-cli download "$MODEL_ID" \
     --cache-dir "$HF_HOME" \
     > "${LOG_DIR}/hf-download.log" 2>&1; then
     log "huggingface-cli download failed; see ${LOG_DIR}/hf-download.log"
-    tail_msg="$(tail -c 400 "${LOG_DIR}/hf-download.log" | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')"
+    tail_msg="$(json_escape "$(tail -c 400 "${LOG_DIR}/hf-download.log")")"
     report_stage download_model "\"message\":\"HF download failed: ${tail_msg}\""
     exit 1
 fi
@@ -190,25 +313,37 @@ report_stage start_server
 #   --api-key                 : require Authorization: Bearer <key> on every request
 #                               (this is the app-generated CC_VLLM_API_KEY)
 #   --served-model-name       : the model identifier clients see (decoupled from $MODEL_ID)
-#   --max-model-len 16384     : agentic coding + autocomplete rarely push past 16k.
-#                               Bigger context = more KV cache memory; 16k keeps
-#                               headroom on a 24 GB card.
-#   --gpu-memory-utilization  : leave ~10% headroom so the AWQ kernel + cloudflared
-#                               + cc-agent don't OOM the card mid-session.
+#   --max-model-len           : 16k on 24 GiB cards, 65k (YaRN x2) on 40 GiB+ —
+#                               see MAX_MODEL_LEN auto-detect block above.
+#   --gpu-memory-utilization  : 0.92 — squeeze ~2 extra GiB of KV cache out of
+#                               every host; AWQ kernels + cloudflared still fit.
 #   --quantization awq_marlin : faster AWQ inference path on Ampere/Ada/Hopper.
+#   --enable-auto-tool-choice + --tool-call-parser hermes :
+#       Lets clients that use native OpenAI tool/function calling send
+#       `tool_choice: "auto"` without vLLM 400ing the request
+#       ('"auto" tool choice requires --enable-auto-tool-choice and
+#       --tool-call-parser to be set'). Qwen 2.5 (incl. Coder) emits tool
+#       calls in the Hermes / ChatML <tool_call> format, so `hermes` is the
+#       correct parser. Harmless for prompt-based agents like Cline (the
+#       parser only kicks in when the model actually emits a <tool_call>),
+#       so there's no downside — it just adds capability for clients that
+#       want native tool calling.
 nohup vllm serve "$MODEL_ID" \
     --host 0.0.0.0 \
     --port "$VLLM_PORT" \
     --api-key "$API_KEY" \
     --served-model-name "$SERVED_MODEL_NAME" \
-    --max-model-len 16384 \
-    --gpu-memory-utilization 0.90 \
+    --max-model-len "$MAX_MODEL_LEN" \
+    --gpu-memory-utilization 0.92 \
     --quantization awq_marlin \
+    --enable-auto-tool-choice \
+    --tool-call-parser hermes \
+    "${EXTRA_VLLM_ARGS[@]}" \
     > "$VLLM_LOG" 2>&1 &
 VLLM_PID=$!
 
-# Wait for vLLM to bind the port. Loading + quantizing 32B AWQ + warming
-# the kernel takes 60-180s on a 4090. Bail early if the process dies.
+# Wait for vLLM to bind the port. Loading + quantizing 32B AWQ + warming the
+# kernel takes 60-180s on a 4090. Bail early if the process dies.
 VLLM_BIND_TIMEOUT_S=300
 for _ in $(seq 1 "$VLLM_BIND_TIMEOUT_S"); do
     if curl -fsS --max-time 1 "http://127.0.0.1:${VLLM_PORT}/v1/models" \
@@ -218,7 +353,7 @@ for _ in $(seq 1 "$VLLM_BIND_TIMEOUT_S"); do
     fi
     if ! kill -0 "$VLLM_PID" 2>/dev/null; then
         log "vLLM exited before binding port ${VLLM_PORT}"
-        tail_msg="$(tail -c 500 "$VLLM_LOG" | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')"
+        tail_msg="$(json_escape "$(tail -c 500 "$VLLM_LOG")")"
         report_stage start_server "\"message\":\"vLLM crashed during startup: ${tail_msg}\""
         exit 1
     fi
@@ -234,44 +369,123 @@ fi
 #
 # Cloudflare quick tunnel: free, no signup, no DNS. cloudflared connects
 # outbound to Cloudflare's edge and gets back a random
-# https://<words>.trycloudflare.com URL that proxies to our local
-# VLLM_PORT. The URL appears in cloudflared's own logs as
-# "Your quick Tunnel has been created! Visit it at:" followed by the URL
-# a couple lines later. We tail the log and grep until we see it.
+# https://<words>.trycloudflare.com URL that proxies to our local VLLM_PORT.
+#
+# trycloudflare.com aggressively rate-limits new tunnel registrations from
+# the same egress IP — Vast hosts can hit HTTP 429 / Error 1015 within
+# seconds when the same datacenter recently spun up several quick tunnels.
+# The retry loop below ABSORBS those 429s with exponential backoff instead
+# of failing the whole instance launch. Tunnel creation is idempotent on
+# Cloudflare's side; each attempt gets a fresh URL.
 
 log "stage: open_tunnel"
 report_stage open_tunnel
 
-nohup "$CLOUDFLARED_BIN" tunnel \
-    --no-autoupdate \
-    --url "http://localhost:${VLLM_PORT}" \
-    > "$TUNNEL_LOG" 2>&1 &
-TUNNEL_PID=$!
-
 TUNNEL_URL=""
-TUNNEL_TIMEOUT_S=60
-for _ in $(seq 1 "$TUNNEL_TIMEOUT_S"); do
-    # The URL line in cloudflared's output looks like:
-    #   |  https://random-words.trycloudflare.com                                   |
-    # We grab the first matching trycloudflare.com URL — the banner repeats
-    # it a couple times but they're all the same value.
-    candidate="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" 2>/dev/null | head -n 1 || true)"
-    if [ -n "$candidate" ]; then
-        TUNNEL_URL="$candidate"
+# Per-attempt cap: long enough for cloudflared to either succeed or reveal a
+# 429, short enough that 4 attempts x this + backoff still fits comfortably
+# under the customer-app overall provisioning timeout (30 min).
+TUNNEL_ATTEMPT_TIMEOUT_S=60
+TUNNEL_MAX_ATTEMPTS=4
+
+# open_tunnel_attempt — runs cloudflared once, watches its log, returns:
+#   0  TUNNEL_URL set and TUNNEL_PID exported
+#   1  process died / no URL — caller may retry
+#   2  HTTP 429 / rate-limited — caller MUST back off before retrying
+open_tunnel_attempt() {
+    : > "$TUNNEL_LOG"
+
+    nohup "$CLOUDFLARED_BIN" tunnel \
+        --no-autoupdate \
+        --url "http://localhost:${VLLM_PORT}" \
+        > "$TUNNEL_LOG" 2>&1 &
+    local pid=$!
+
+    local elapsed=0
+    while [ "$elapsed" -lt "$TUNNEL_ATTEMPT_TIMEOUT_S" ]; do
+        local candidate
+        candidate="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" 2>/dev/null | head -n 1 || true)"
+        if [ -n "$candidate" ]; then
+            TUNNEL_URL="$candidate"
+            TUNNEL_PID="$pid"
+            return 0
+        fi
+
+        # 429 detection: cloudflared logs include "error code: 1015" and
+        # "429" in different lines depending on Cloudflare's response. Match
+        # either token to avoid relying on exact phrasing across versions.
+        if grep -qE '(\b429\b|Too Many Requests|error code: ?1015)' "$TUNNEL_LOG" 2>/dev/null; then
+            log "cloudflared rate-limited (HTTP 429) on attempt"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 2
+        fi
+
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log "cloudflared exited on attempt"
+            return 1
+        fi
+
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    # Timed out without URL or 429: kill and let caller retry.
+    log "cloudflared attempt timed out without URL"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 1
+}
+
+# Suppress both `set -e` AND the ERR trap for the retry block — we want a
+# non-zero return from open_tunnel_attempt to drive our retry/backoff logic,
+# NOT to kill the script.
+#
+# Why both: `trap - ERR` alone is NOT enough. `set -e` is what causes the
+# shell to exit on a non-zero return; the ERR trap is just the hook that
+# fires before the exit. Without `set +e` here, the very first
+# open_tunnel_attempt returning 2 (HTTP 429) immediately exits provision.sh —
+# silently, with no report_stage ever sent — and the user sits at "open_tunnel"
+# until the backend's overall timeout flips the instance to ERROR.
+#
+# Re-enable both on the way out so any subsequent failure still gets caught
+# by the global fatal handler.
+set +e
+trap - ERR
+TUNNEL_LAST_RC=1
+for attempt in $(seq 1 "$TUNNEL_MAX_ATTEMPTS"); do
+    log "cloudflared attempt ${attempt}/${TUNNEL_MAX_ATTEMPTS}"
+
+    open_tunnel_attempt
+    TUNNEL_LAST_RC=$?
+
+    if [ "$TUNNEL_LAST_RC" -eq 0 ]; then
         break
     fi
-    if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-        log "cloudflared exited before producing a tunnel URL"
-        tail_msg="$(tail -c 400 "$TUNNEL_LOG" | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')"
-        report_stage open_tunnel "\"message\":\"cloudflared failed: ${tail_msg}\""
-        exit 1
+
+    if [ "$attempt" -lt "$TUNNEL_MAX_ATTEMPTS" ]; then
+        # Exponential backoff for 429 (trycloudflare hates this egress IP
+        # right now — needs real wall-clock time), linear for generic
+        # failures (usually recover on the next attempt).
+        if [ "$TUNNEL_LAST_RC" -eq 2 ]; then
+            sleep_for=$((30 * attempt))
+        else
+            sleep_for=$((5 * attempt))
+        fi
+        log "backing off ${sleep_for}s before retry"
+        sleep "$sleep_for"
     fi
-    sleep 1
 done
+set -e
+trap 'handle_uncaught_error "$LINENO" "$BASH_COMMAND"' ERR
 
 if [ -z "$TUNNEL_URL" ]; then
-    log "cloudflared did not surface a URL within ${TUNNEL_TIMEOUT_S}s"
-    report_stage open_tunnel "\"message\":\"cloudflared did not produce a trycloudflare URL in ${TUNNEL_TIMEOUT_S}s\""
+    tail_msg="$(json_escape "$(tail -c 400 "$TUNNEL_LOG" 2>/dev/null || true)")"
+    if [ "$TUNNEL_LAST_RC" -eq 2 ]; then
+        report_stage open_tunnel "\"message\":\"cloudflared rate-limited (HTTP 429) by trycloudflare.com after ${TUNNEL_MAX_ATTEMPTS} retries: ${tail_msg}\""
+    else
+        report_stage open_tunnel "\"message\":\"cloudflared failed after ${TUNNEL_MAX_ATTEMPTS} retries: ${tail_msg}\""
+    fi
     exit 1
 fi
 
@@ -297,5 +511,6 @@ log "provisioning complete"
 log "  tunnel: ${TUNNEL_URL}"
 log "  api key: ${API_KEY} (owned by the customer app)"
 log "  model name: ${SERVED_MODEL_NAME}"
-log "vLLM PID: ${VLLM_PID}; cloudflared PID: ${TUNNEL_PID}"
+log "  max_model_len: ${MAX_MODEL_LEN} (GPU VRAM ${GPU_VRAM_MB} MB, YaRN=${YARN_NEEDED})"
+log "vLLM PID: ${VLLM_PID}; cloudflared PID: ${TUNNEL_PID:-?}"
 exit 0
