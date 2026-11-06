@@ -178,6 +178,28 @@ json_escape() {
     printf '%s' "$1" | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g'
 }
 
+# Stop Vast's preinstalled vLLM and free the ports we are about to bind.
+# Missing supervisorctl / fuser is fine (local runs, non-Vast images).
+stop_image_vllm() {
+    if command -v supervisorctl >/dev/null 2>&1; then
+        supervisorctl stop vllm >/dev/null 2>&1 || true
+    fi
+    fuser -k 18000/tcp >/dev/null 2>&1 || true
+    if [ "${VLLM_PORT}" != "18000" ]; then
+        fuser -k "${VLLM_PORT}/tcp" >/dev/null 2>&1 || true
+    fi
+}
+
+# True when OUR server is the one answering. The image server also returns
+# 200 for /v1/models (it has no API key, so it ignores Authorization) and
+# its model id is not $SERVED_MODEL_NAME (default qwen2.5-coder-32b).
+vllm_serving_our_model() {
+    local body
+    body="$(curl -fsS --max-time 1 "http://127.0.0.1:${VLLM_PORT}/v1/models" \
+        -H "Authorization: Bearer ${API_KEY}" 2>/dev/null || true)"
+    printf '%s' "$body" | grep -F -q "\"${SERVED_MODEL_NAME}\""
+}
+
 # trap-ERR handler — fires for any command that fails under `set -e` and
 # wasn't already handled with explicit `report_stage ... "\"message\":...\""`
 # + `exit 1`. Without this, an unexpected failure (e.g. `pip install` 503,
@@ -263,13 +285,20 @@ if ! [ -x "$CLOUDFLARED_BIN" ]; then
     chmod +x "$CLOUDFLARED_BIN"
 fi
 
-# Kill any pre-existing process holding VLLM_PORT — the upstream Vast vllm
-# template autostarts its own vLLM with a default model on first boot
-# (DeepSeek-R1-Distill-Llama-8B at the time of writing). Without this we'd
-# fail to bind 8000 and spend ages debugging. fuser exits non-zero when
-# nothing's bound, hence the `|| true`.
-log "freeing port ${VLLM_PORT} if held by another process"
-fuser -k "${VLLM_PORT}/tcp" 2>/dev/null || true
+# The Vast vLLM image supervises its own server on 127.0.0.1:18000
+# (DeepSeek-R1-Distill-Llama-8B, no --enable-auto-tool-choice). Caddy
+# publishes that process as external port 8000, which is also $VLLM_PORT.
+# A health check that only requires HTTP 200 on 8000 therefore succeeds
+# against the image server, and clients get
+# `"auto" tool choice requires --enable-auto-tool-choice`.
+#
+# `supervisorctl stop` stays stopped (the program's autorestart is
+# `unexpected`, so a raw kill comes back). fuser covers a server that was
+# not started by supervisor. Do this before the model download so that
+# process is not holding the GPU while we fetch weights, and again
+# immediately before we bind.
+log "stopping the image vLLM (supervisor program vllm, ports 18000 and ${VLLM_PORT})"
+stop_image_vllm
 sleep 2
 
 # --- stage 2: download_model ---------------------------------------------
@@ -309,6 +338,13 @@ report_stage download_model '"progress_pct":100'
 log "stage: start_server"
 report_stage start_server
 
+# The image server can come up during the model download (supervisor waits
+# for Ray, then starts). Stop it again so it cannot hold port 18000 or the
+# GPU, and free port 8000 (Caddy's proxy in front of that server) so we can bind.
+log "stopping the image vLLM before bind"
+stop_image_vllm
+sleep 1
+
 # Launch vLLM as a background process. Key flags:
 #   --api-key                 : require Authorization: Bearer <key> on every request
 #                               (this is the app-generated CC_VLLM_API_KEY)
@@ -342,13 +378,17 @@ nohup vllm serve "$MODEL_ID" \
     > "$VLLM_LOG" 2>&1 &
 VLLM_PID=$!
 
-# Wait for vLLM to bind the port. Loading + quantizing 32B AWQ + warming the
-# kernel takes 60-180s on a 4090. Bail early if the process dies.
+# Wait until /v1/models lists $SERVED_MODEL_NAME (qwen2.5-coder-32b unless
+# overridden). HTTP 200 alone is not enough: Caddy on this image proxies
+# port 8000 to the image vLLM, which answers /v1/models without our API key.
+# Loading + quantizing 32B AWQ takes 60-180s on a 4090. Bail if our process
+# dies, or if the timeout expires without that model id.
 VLLM_BIND_TIMEOUT_S=300
+VLLM_READY=0
 for _ in $(seq 1 "$VLLM_BIND_TIMEOUT_S"); do
-    if curl -fsS --max-time 1 "http://127.0.0.1:${VLLM_PORT}/v1/models" \
-        -H "Authorization: Bearer ${API_KEY}" >/dev/null 2>&1; then
-        log "vLLM ready on port ${VLLM_PORT}"
+    if vllm_serving_our_model; then
+        log "vLLM ready on port ${VLLM_PORT} serving ${SERVED_MODEL_NAME}"
+        VLLM_READY=1
         break
     fi
     if ! kill -0 "$VLLM_PID" 2>/dev/null; then
@@ -360,8 +400,11 @@ for _ in $(seq 1 "$VLLM_BIND_TIMEOUT_S"); do
     sleep 1
 done
 
-if ! kill -0 "$VLLM_PID" 2>/dev/null; then
-    report_stage start_server "\"message\":\"vLLM died before completing startup\""
+if [ "$VLLM_READY" != "1" ]; then
+    tail_msg="$(json_escape "$(tail -c 500 "$VLLM_LOG" 2>/dev/null || true)")"
+    model_msg="$(json_escape "$SERVED_MODEL_NAME")"
+    log "vLLM did not serve ${SERVED_MODEL_NAME} on port ${VLLM_PORT}"
+    report_stage start_server "\"message\":\"vLLM did not serve ${model_msg}: ${tail_msg}\""
     exit 1
 fi
 
